@@ -1,14 +1,13 @@
 <?php
 
 class SXUrlGenerator {
-
     private function httpGet($url) {
         $ch = curl_init();
         curl_setopt_array($ch, [
             CURLOPT_URL => $url,
             CURLOPT_RETURNTRANSFER => true,
             CURLOPT_TIMEOUT => 10,
-            CURLOPT_USERAGENT => 'SX-URL-Generator/1.0'
+            CURLOPT_USERAGENT => 'SX-URL-Generator/1.0 (tayodele-ctr@wikimedia.org)'
         ]);
 
         $response = curl_exec($ch);
@@ -18,28 +17,39 @@ class SXUrlGenerator {
         return ($httpCode === 200 && $response) ? $response : null;
     }
 
-    public function getEnglishTitle($targetTitle, $targetLang) {
+    public function getEnglishTitles($targetTitles, $targetLang) {
+        // Join all titles using | for small lists of (10-20) articles, we can do them all at once
+        $titlesBatch = implode('|', $targetTitles);
+
         $url = "https://www.wikidata.org/w/api.php?" . http_build_query([
             'action' => 'wbgetentities',
             'sites' => $targetLang . 'wiki',
-            'titles' => $targetTitle,
+            'titles' => $titlesBatch,
             'props' => 'sitelinks',
             'format' => 'json'
         ]);
 
         $response = $this->httpGet($url);
-        if (!$response) return null;
+        if (!$response) return [];
 
         $data = json_decode($response, true);
-        if (isset($data['error']) || !isset($data['entities'])) return null;
+        if (isset($data['error']) || !isset($data['entities'])) return [];
 
+        $results = [];
         foreach ($data['entities'] as $entity) {
             if (isset($entity['sitelinks']['enwiki'])) {
-                return $entity['sitelinks']['enwiki']['title'];
+                // Find which original title this entity corresponds to
+                foreach ($entity['sitelinks'] as $site => $sitelink) {
+                    if (strpos($site, $targetLang) === 0) {
+                        $originalTitle = $sitelink['title'];
+                        $results[$originalTitle] = $entity['sitelinks']['enwiki']['title'];
+                        break;
+                    }
+                }
             }
         }
 
-        return null;
+        return $results;
     }
 
     public function articleExists($title, $lang = 'en') {
@@ -66,47 +76,49 @@ class SXUrlGenerator {
 
     public function generateSxUrl($sourceTitle, $fromLang, $toLang) {
         $encodedTitle = urlencode($sourceTitle);
-        return "https://{$fromLang}.wikipedia.org/w/index.php?" . http_build_query([
+        return "https://{$toLang}.wikipedia.org/w/index.php?" . http_build_query([
             'title' => 'Special:ContentTranslation',
-            'filter-type' => 'automatic',
-            'filter-id' => 'previous-edits',
+            'page' => $sourceTitle,
             'from' => $fromLang,
-            'to' => $toLang,
-            'active-list' => 'suggestions',
-            'page' => $sourceTitle
-        ]) . '#/sx/section-selector';
+            'to' => $toLang
+        ]);
     }
 
     public function generateTable($articles, $targetLang, $sourceLang = 'en', $maxUrls = 20) {
         $rows = [];
         $urlCount = 0;
 
+        // OPTIMIZED: Single Wikidata API call for all articles
+        $englishTitles = $this->getEnglishTitles($articles, $targetLang);
+
+        // Process each article with pre-fetched English titles
         foreach ($articles as $i => $article) {
             if ($urlCount >= $maxUrls) break;
 
             $num = $i + 1;
-            $englishTitle = $this->getEnglishTitle($article, $targetLang);
+            $englishTitle = $englishTitles[$article] ?? null;
 
             if (!$englishTitle) {
                 $rows[] = $this->createRow($num, $article, null, $targetLang, $sourceLang, "❌ No {$sourceLang} equivalent");
                 continue;
             }
 
+            // Individual checks for article existence/ new data exists
             if ($this->articleExists($englishTitle, $sourceLang)) {
                 $sxUrl = $this->generateSxUrl($englishTitle, $sourceLang, $targetLang);
-                $rows[] = $this->createRow($num, $article, $englishTitle, '✅ Ready', $targetLang, $sourceLang, $sxUrl);
+                $rows[] = $this->createRow($num, $article, $englishTitle, $targetLang, $sourceLang, '✅ Ready', $sxUrl);
                 $urlCount++;
             } else {
                 $rows[] = $this->createRow($num, $article, $englishTitle, $targetLang, $sourceLang, '❌ No source');
             }
 
-            sleep(1); // Rate limiting
+            sleep(1); // Rate limiting API calls not to overload server
         }
 
         return $this->formatTable($rows, $sourceLang, $targetLang);
     }
 
-    private function createRow($num, $targetArticle, $sourceArticle, $status, $targetLang, $sourceLang, $sxUrl = null) {
+    private function createRow($num, $targetArticle, $sourceArticle, $targetLang, $sourceLang, $status, $sxUrl = null) {
         $targetLink = "[[:{$targetLang}:{$targetArticle}|{$targetArticle}]]";
         $sourceLink = $sourceArticle ? "[[:{$sourceLang}:{$sourceArticle}|{$sourceArticle}]]" : "''Not found on Wikidata''";
         $translationLink = $sxUrl ? "[{$sxUrl} Start Translation]" : "<span style=\"color: #ccc;\">Source missing</span>";
@@ -125,13 +137,17 @@ class SXUrlGenerator {
     }
 }
 
-// Configuration
+// Configuration - typical use case
 $config = [
     'targetLang' => 'yo',
     'sourceLang' => 'en',
     'maxUrls' => 15,
     'articles' => [
         'Ìjàmbá ìtúká ẹ̀búté Bèírùtù ọdún 2020',
+		'Ìbàdàn',
+        'Lágós',
+        'Sáyẹ́ǹsì',
+        'Nàìjíríà',
     ]
 ];
 
